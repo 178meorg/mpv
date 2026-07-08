@@ -416,8 +416,7 @@ if features['cocoa']
     path_source += files('osdep/path-mac.m')
     sources += files('osdep/language-mac.c',
                      'osdep/utils-mac.c',
-                     'osdep/mac/app_bridge.m',
-                     'player/clipboard/clipboard-mac.m')
+                     'osdep/mac/app_bridge.m')
     main_fn_source = files('osdep/main-fn-mac.c')
 endif
 
