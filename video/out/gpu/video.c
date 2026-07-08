@@ -1001,7 +1001,11 @@ static void init_video(struct gl_video *p)
     }
     p->color_swizzle[4] = '\0';
 
-    mp_image_params_restore_dovi_mapping(&p->image_params);
+    if (p->image_params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION ||
+        !p->image_params.repr.dovi)
+    {
+        mp_image_params_restore_dovi_mapping(&p->image_params);
+    }
     mp_image_params_guess_csp(&p->image_params);
 
     av_lfg_init(&p->lfg, 1);
@@ -2405,6 +2409,132 @@ static void pass_read_tex(struct gl_video *p, struct ra_tex *tex)
     copy_image(p, &(int){0}, img);
 }
 
+static void pass_dovi_reshape_component(struct gl_video *p,
+                                        const struct pl_reshape_data *comp,
+                                        int c)
+{
+    int num_pivots = comp->num_pivots;
+    if (num_pivots < 2)
+        return;
+
+    num_pivots = MPMIN(num_pivots, 9);
+    GLSLF("{\n");
+    GLSLF("float dovi_x = dovi_src[%d];\n", c);
+    for (int i = 0; i < num_pivots - 1; i++) {
+        if (i == 0) {
+            GLSLF("if (dovi_x <= %f) {\n", comp->pivots[i + 1]);
+        } else if (i < num_pivots - 2) {
+            GLSLF("} else if (dovi_x <= %f) {\n", comp->pivots[i + 1]);
+        } else {
+            GLSLF("} else {\n");
+        }
+
+        if (comp->method[i] == 0) {
+            const float *coeff = comp->poly_coeffs[i];
+            GLSLF("dovi_dst[%d] = %f + dovi_x * (%f + dovi_x * %f);\n",
+                  c, coeff[0], coeff[1], coeff[2]);
+        } else {
+            int order_count = MPMIN(comp->mmr_order[i], 3);
+            GLSLF("vec3 dovi_sig_order = dovi_src;\n");
+            GLSLF("dovi_dst[%d] = %f;\n", c, comp->mmr_constant[i]);
+            for (int order = 0; order < order_count; order++) {
+                const float *coeff = comp->mmr_coeffs[i][order];
+                GLSLF("dovi_dst[%d] += %f * dovi_sig_order.x + "
+                      "%f * dovi_sig_order.y + "
+                      "%f * dovi_sig_order.z + "
+                      "%f * dovi_sig_order.x * dovi_sig_order.y + "
+                      "%f * dovi_sig_order.x * dovi_sig_order.z + "
+                      "%f * dovi_sig_order.y * dovi_sig_order.z + "
+                      "%f * dovi_sig_order.x * dovi_sig_order.y * dovi_sig_order.z;\n",
+                      c, coeff[0], coeff[1], coeff[2], coeff[3], coeff[4],
+                      coeff[5], coeff[6]);
+                if (order + 1 < order_count)
+                    GLSL(dovi_sig_order *= dovi_src;)
+            }
+        }
+    }
+    GLSLF("}\n");
+    GLSLF("}\n");
+}
+
+static void pass_dovi_reshape(struct gl_video *p,
+                              const struct pl_dovi_metadata *dovi)
+{
+    GLSLF("// Dolby Vision reshaping\n");
+    GLSLF("vec3 dovi_src = color.rgb;\n");
+    GLSLF("vec3 dovi_dst = color.rgb;\n");
+    for (int c = 0; c < 3; c++)
+        pass_dovi_reshape_component(p, &dovi->comp[c], c);
+    GLSLF("color.rgb = dovi_dst;\n");
+}
+
+static void set_colorconv_alpha(struct gl_video *p)
+{
+    p->components = 3;
+    if (!p->has_alpha) {
+        GLSL(color.a = 1.0;)
+    } else if (p->image_params.repr.alpha == PL_ALPHA_PREMULTIPLIED) {
+        p->components = 4;
+    } else {
+        p->components = 4;
+        GLSL(color = vec4(color.rgb * color.a, color.a);)
+    }
+}
+
+static bool pass_convert_dovi(struct gl_video *p,
+                              const struct mp_csp_params *cparams)
+{
+    struct gl_shader_cache *sc = p->sc;
+    const struct mp_image_params *params =
+        p->image.mpi ? &p->image.mpi->params : &p->image_params;
+    struct pl_color_repr repr = params->repr;
+    const struct pl_dovi_metadata *dovi = repr.dovi;
+
+    if (repr.sys != PL_COLOR_SYSTEM_DOLBYVISION || !dovi)
+        return false;
+
+    struct pl_color_adjustment adj = {
+        .brightness = cparams->brightness,
+        .contrast = cparams->contrast,
+        .saturation = cparams->saturation,
+        .hue = cparams->hue,
+        .gamma = cparams->gamma,
+    };
+    float norm = pl_color_repr_normalize(&repr);
+    if (norm != 1.0f)
+        GLSLF("color.rgb *= vec3(%f);\n", norm);
+
+    pass_dovi_reshape(p, dovi);
+
+    struct pl_transform3x3 m = pl_color_repr_decode(&repr, &adj);
+    gl_sc_uniform_mat3(sc, "dovi_colormatrix", true, &m.mat.m[0][0]);
+    gl_sc_uniform_vec3(sc, "dovi_colormatrix_c", m.c);
+    GLSL(color.rgb = mat3(dovi_colormatrix) * color.rgb + dovi_colormatrix_c;)
+
+    pass_linearize(sc, PL_COLOR_TRC_PQ);
+
+    enum pl_color_primaries prim = params->color.primaries;
+    if (prim == PL_COLOR_PRIM_UNKNOWN)
+        prim = PL_COLOR_PRIM_BT_2020;
+    pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(prim));
+    pl_matrix3x3_mul(&lms2rgb, &dovi->linear);
+    gl_sc_uniform_mat3(sc, "dovi_lms2rgb", true, &lms2rgb.m[0][0]);
+    GLSL(color.rgb = mat3(dovi_lms2rgb) * color.rgb;)
+
+    pass_delinearize(sc, PL_COLOR_TRC_PQ);
+
+    p->image_params.repr = repr;
+    p->image_params.repr.sys = PL_COLOR_SYSTEM_RGB;
+    p->image_params.repr.levels = PL_COLOR_LEVELS_FULL;
+    p->image_params.color = params->color;
+    p->image_params.color.primaries = prim;
+    p->image_params.color.transfer = PL_COLOR_TRC_PQ;
+    pl_color_space_infer(&p->image_params.color);
+
+    set_colorconv_alpha(p);
+    return true;
+}
+
 // yuv conversion, and any other conversions before main up/down-scaling
 static void pass_convert_yuv(struct gl_video *p)
 {
@@ -2428,6 +2558,9 @@ static void pass_convert_yuv(struct gl_video *p)
 
     // We always explicitly normalize the range in pass_read_video
     cparams.input_bits = cparams.texture_bits = 0;
+
+    if (pass_convert_dovi(p, &cparams))
+        return;
 
     // Conversion to RGB. For RGB itself, this still applies e.g. brightness
     // and contrast controls, or expansion of e.g. LSB-packed 10 bit data.
@@ -2481,15 +2614,7 @@ static void pass_convert_yuv(struct gl_video *p)
               gl_sc_bvec(p->sc, 3));
     }
 
-    p->components = 3;
-    if (!p->has_alpha) {
-        GLSL(color.a = 1.0;)
-    } else if (p->image_params.repr.alpha == PL_ALPHA_PREMULTIPLIED) {
-        p->components = 4;
-    } else {
-        p->components = 4;
-        GLSL(color = vec4(color.rgb * color.a, color.a);) // straight -> premul
-    }
+    set_colorconv_alpha(p);
 }
 
 static void get_scale_factors(struct gl_video *p, bool transpose_rot, double xy[2])
