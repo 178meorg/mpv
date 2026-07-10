@@ -2637,6 +2637,10 @@ static bool pass_convert_dovi(struct gl_video *p,
     if (repr.sys != PL_COLOR_SYSTEM_DOLBYVISION || !dovi)
         return false;
 
+    // pass_read_video() already normalizes fixed-point texture samples into
+    // the range expected by the old vo_gpu color conversion path.
+    repr.bits = (struct pl_bit_encoding){0};
+
     struct pl_color_adjustment adj = {
         .brightness = cparams->brightness,
         .contrast = cparams->contrast,
@@ -2667,9 +2671,6 @@ static bool pass_convert_dovi(struct gl_video *p,
 
     pass_delinearize(sc, PL_COLOR_TRC_PQ);
 
-    p->image_params.repr = repr;
-    p->image_params.repr.sys = PL_COLOR_SYSTEM_RGB;
-    p->image_params.repr.levels = PL_COLOR_LEVELS_FULL;
     p->image_params.color = params->color;
     p->image_params.color.primaries = prim;
     p->image_params.color.transfer = PL_COLOR_TRC_PQ;
